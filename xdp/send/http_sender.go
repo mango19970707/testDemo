@@ -23,7 +23,7 @@ type HTTPSender struct {
 func (s *HTTPSender) Send() {
 	_, err := initXdpSocket()
 	if err != nil {
-		fmt.Println("Fail to initialize the XDP socket:", err)
+		fmt.Println("Fail to send:", err)
 		return
 	}
 }

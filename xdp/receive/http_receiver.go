@@ -15,7 +15,11 @@ type HTTPReceiver struct {
 }
 
 func (r *HTTPReceiver) Receive() {
-
+	err := restartXdp()
+	if err != nil {
+		fmt.Println("Fail to receive:", err)
+		return
+	}
 }
 
 var (
@@ -28,7 +32,7 @@ func init() {
 	xdpQueueNum = 1
 }
 
-func RestartXdp() (err error) {
+func restartXdp() (err error) {
 	// 通过配置XDP对列数量开启，没有网卡时不开启。
 	if len(nicName) == 0 || xdpQueueNum == 0 {
 		return errors.New("XDP mode is not enabled")

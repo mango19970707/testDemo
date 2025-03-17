@@ -1,14 +1,14 @@
 package main
 
 import (
-	"fmt"
 	"testDemo/xdp/receive"
+	"testDemo/xdp/send"
 )
 
 func main() {
-	go func() {
-		if err := receive.RestartXdp(); err != nil {
-			fmt.Println(err)
-		}
-	}()
+	receiver := receive.HTTPReceiver{}
+	sender := send.HTTPSender{}
+	go receiver.Receive()
+	sender.Send()
+	select {}
 }
