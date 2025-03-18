@@ -1,71 +1,55 @@
 package send
 
 import (
-	"fmt"
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
-	_chan "testDemo/xdp/chan"
+	"log"
 )
-
-var (
-	nicName     string
-	xdpQueueNum int
-)
-
-func init() {
-	nicName = "eno4"
-	xdpQueueNum = 1
-}
 
 type HTTPSender struct {
+	NicName  string
+	QueueNum int
 }
 
-func (s *HTTPSender) Send() {
-	_, err := initXdpSocket()
+func (s *HTTPSender) Send(msgChan <-chan []byte) error {
+	link, err := netlink.LinkByName(s.NicName)
 	if err != nil {
-		fmt.Println("Fail to send:", err)
-		return
-	}
-}
-
-func initXdpSocket() ([]*xdp.Socket, error) {
-	link, err := netlink.LinkByName(nicName)
-	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// 创建XDP程序（使用默认ebpf程序），无自定义内核代码
-	program, err := xdp.NewProgram(xdpQueueNum)
+	program, err := xdp.NewProgram(s.QueueNum)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer program.Close()
 
 	// 附加到网络接口
 	if err = program.Attach(link.Attrs().Index); err != nil {
-		return nil, err
+		return err
 	}
 	defer program.Detach(link.Attrs().Index)
 
-	xsks := make([]*xdp.Socket, xdpQueueNum)
+	xsks := make([]*xdp.Socket, s.QueueNum)
 	for i := 0; i < len(xsks); i++ {
 		if xsks[i], err = xdp.NewSocket(link.Attrs().Index, i, nil); err != nil {
-			return nil, err
+			return err
 		}
 		defer xsks[i].Close()
 		idx := i
-		go transmit(xsks[idx])
+		go transmit(xsks[idx], msgChan)
 	}
-	return xsks, nil
+	return nil
 }
 
-func transmit(xsk *xdp.Socket) {
+func transmit(xsk *xdp.Socket, msgChan <-chan []byte) {
 	pos := 0
-	batch := 64
+	batch := 1
 	packets := make([][]byte, batch)
 	for {
 		if pos < batch {
-			packets[pos] = <-_chan.HTTPChan
+			log.Print("send message: ")
+			packets[pos] = <-msgChan
 			pos++
 			continue
 		}

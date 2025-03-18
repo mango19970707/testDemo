@@ -1,5 +1,5 @@
 package send
 
 type sender interface {
-	Send()
+	Send(nicName string, queueNum int) error
 }

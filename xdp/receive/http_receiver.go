@@ -7,91 +7,73 @@ import (
 	"github.com/safchain/ethtool"
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
-	_chan "testDemo/xdp/chan"
-	"time"
+	"log"
 )
 
 type HTTPReceiver struct {
+	NicName  string
+	QueueNum int
 }
 
-func (r *HTTPReceiver) Receive() {
-	err := restartXdp()
-	if err != nil {
-		fmt.Println("Fail to receive:", err)
-		return
-	}
-}
-
-var (
-	nicName     string
-	xdpQueueNum int
-)
-
-func init() {
-	nicName = "eno3"
-	xdpQueueNum = 1
-}
-
-func restartXdp() (err error) {
+func (r *HTTPReceiver) Receive(msgChan chan<- []byte) error {
 	// 通过配置XDP对列数量开启，没有网卡时不开启。
-	if len(nicName) == 0 || xdpQueueNum == 0 {
+	if len(r.NicName) == 0 || r.QueueNum == 0 {
 		return errors.New("XDP mode is not enabled")
 	}
-	queueNum := xdpQueueNum
 	// TODO: 当前XDP只支持一个网卡，后续XDP以透明模式为主。配置一个网卡就是流量监听，如果配置两个就是相互转发
-	link, err := netlink.LinkByName(nicName)
+	link, err := netlink.LinkByName(r.NicName)
 	if err != nil {
-		return
+		return err
 	}
 
 	// 设置MTU为3040, XDP限制
 	if err = netlink.LinkSetMTU(link, 3040); err != nil {
-		return
+		return err
 	}
 
 	// 开启混杂模式
 	if err = netlink.SetPromiscOn(link); err != nil {
-		return
+		return err
 	}
 	defer netlink.SetPromiscOff(link)
 
 	// 在设置MTU之后添加通道数设置逻辑
 	ethTool, err := ethtool.NewEthtool()
 	if err != nil {
-		return
+		return err
 	}
 	defer ethTool.Close()
 
 	// 获取当前通道配置
-	channels, err := ethTool.GetChannels(nicName)
+	channels, err := ethTool.GetChannels(r.NicName)
 	if err != nil {
-		return
+		return err
 	}
 
 	// 只修改Combined通道数（XDP通常使用Combined队列）
-	channels.MaxCombined = uint32(xdpQueueNum)
+	channels.MaxCombined = uint32(r.QueueNum)
 
 	// 设置新的通道配置
-	if _, err = ethTool.SetChannels(nicName, channels); err != nil {
+	if _, err = ethTool.SetChannels(r.NicName, channels); err != nil {
 		return err
 	}
 
 	// 创建XDP程序（使用默认ebpf程序），无自定义内核代码
-	program, err := xdp.NewProgram(queueNum)
+	program, err := xdp.NewProgram(r.QueueNum)
 	if err != nil {
-		return
+		return err
 	}
 	defer program.Close()
 
 	// 附加到网络接口
 	if err = program.Attach(link.Attrs().Index); err != nil {
-		return
+		return err
 	}
 	defer program.Detach(link.Attrs().Index)
 
 	// 统一创建所有队列的socket
-	xskList := make([]*xdp.Socket, queueNum)
-	for qid := 0; qid < queueNum; qid++ {
+	xskList := make([]*xdp.Socket, r.QueueNum)
+	for qid := 0; qid < r.QueueNum; qid++ {
 		xsk, err := xdp.NewSocket(link.Attrs().Index, qid, nil)
 		if err != nil {
 			return err
@@ -133,15 +115,13 @@ func restartXdp() (err error) {
 
 					for i := 0; i < len(rxDescs); i++ {
 						pktData := xsk.GetFrame(rxDescs[i])
-						_chan.HTTPChan <- bytes.Clone(pktData)
+						log.Print("receive message: ", string(pktData))
+						msgChan <- bytes.Clone(pktData)
 					}
 				}
 			}
 		}(qid, xsk)
 	}
 
-	// 主线程统计输出
-	ticker := time.NewTicker(time.Second * 5)
-	defer ticker.Stop()
-	return
+	return nil
 }

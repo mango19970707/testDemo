@@ -1,5 +1,5 @@
 package receive
 
 type receiver interface {
-	Receive()
+	Receive(nicName string, msgChan <-chan []byte) error
 }
