@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/safchain/ethtool"
 	"github.com/slavc/xdp"
@@ -16,9 +17,11 @@ import (
 func main() {
 	var clientNic, serverNic nicInfo
 	if err := clientNic.New("enp26s0f0", 1); err != nil {
+		fmt.Printf("Failed to initialize client NIC: %v\n", err)
 		return
 	}
 	if err := serverNic.New("enp26s0f1", 1); err != nil {
+		fmt.Printf("Failed to initialize server NIC: %v\n", err)
 		return
 	}
 	client2ServerChan := make(chan []byte, 10000)
@@ -62,104 +65,126 @@ func (n *nicInfo) New(nicName string, queueNum int) error {
 	n.NicName = nicName
 	n.QueueNum = queueNum
 
+	// 获取网卡信息
 	link, err := netlink.LinkByName(nicName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get link by name: %v", err)
 	}
 
 	// 设置MTU为3040, XDP限制
 	if err = netlink.LinkSetMTU(link, 3040); err != nil {
-		return err
+		return fmt.Errorf("failed to set MTU: %v", err)
 	}
+	fmt.Printf("Successfully set MTU for %s to 3040\n", nicName)
 
 	// 开启混杂模式
 	if err = netlink.SetPromiscOn(link); err != nil {
-		return err
+		return fmt.Errorf("failed to set promiscuous mode: %v", err)
 	}
-	defer netlink.SetPromiscOff(link)
+	fmt.Printf("Successfully set promiscuous mode for %s\n", nicName)
+	defer func() {
+		if err := netlink.SetPromiscOff(link); err != nil {
+			fmt.Printf("Failed to turn off promiscuous mode: %v\n", err)
+		}
+	}()
 
-	// 在设置MTU之后添加通道数设置逻辑
+	// 设置通道数
 	ethTool, err := ethtool.NewEthtool()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create ethtool: %v", err)
 	}
 	defer ethTool.Close()
 
-	// 获取当前通道配置
 	channels, err := ethTool.GetChannels(n.NicName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get channels: %v", err)
 	}
 
-	// 只修改Combined通道数（XDP通常使用Combined队列）
+	// 修改Combined通道数
 	channels.MaxCombined = uint32(queueNum)
-
-	// 设置新的通道配置
-	if _, err = ethTool.SetChannels(nicName, channels); err != nil {
-		return err
+	if _, err := ethTool.SetChannels(nicName, channels); err != nil {
+		fmt.Printf("Setting combined channels to %d for %s...\n", queueNum, nicName)
 	}
+	fmt.Printf("Successfully set combined channels to %d for %s\n", queueNum, nicName)
 
-	// 创建XDP程序（使用默认ebpf程序），无自定义内核代码
+	// 创建XDP程序（使用默认ebpf程序）
 	program, err := xdp.NewProgram(queueNum)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create XDP program: %v", err)
 	}
-	//defer program.Close()
+	n.Program = program
+	defer func() {
+		if err := program.Close(); err != nil {
+			fmt.Printf("Failed to close XDP program: %v\n", err)
+		}
+	}()
 
-	// 附加到网络接口
+	// 附加XDP程序到网卡
 	if err = program.Attach(link.Attrs().Index); err != nil {
-		return err
+		return fmt.Errorf("failed to attach XDP program to %s: %v", nicName, err)
 	}
-	defer program.Detach(link.Attrs().Index)
+	fmt.Printf("Successfully attached XDP program to %s\n", nicName)
 
-	// 统一创建所有队列的socket
+	// 轮询检查 XDP 是否真正生效
+	for i := 0; i < 10; i++ {
+		if checkXDPAttached(nicName) {
+			fmt.Printf("XDP successfully attached to %s\n", nicName)
+			break
+		}
+		time.Sleep(100 * time.Millisecond) // 每 100ms 检查一次
+	}
+
+	// 创建XDP套接字
 	n.socketList = make([]*xdp.Socket, queueNum)
 	for qid := 0; qid < len(n.socketList); qid++ {
 		xsk, err := xdp.NewSocket(link.Attrs().Index, qid, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create XDP socket for queue %d: %v", qid, err)
 		}
-		//defer xsk.Close()
 
 		if err = program.Register(qid, xsk.FD()); err != nil {
-			return err
+			return fmt.Errorf("failed to register socket with XDP program: %v", err)
 		}
-		defer program.Unregister(qid)
 		n.socketList[qid] = xsk
+		fmt.Printf("Successfully created and registered XDP socket for queue %d\n", qid)
 	}
 
 	return nil
 }
 
+func checkXDPAttached(nicName string) bool {
+	link, err := netlink.LinkByName(nicName)
+	if err != nil {
+		fmt.Printf("Failed to get link info for %s: %v\n", nicName, err)
+		return false
+	}
+	return link.Attrs().Xdp != nil // 只要 XDP 不是 nil，就说明附加成功
+}
+
 func (n *nicInfo) receive(msgChan chan<- []byte) {
 	for qid, xsk := range n.socketList {
 		go func(qid int, xsk *xdp.Socket) {
-
 			for {
-				// If there are any free slots on the Fill queue...
+				// 如果Fill队列有空闲位置
 				if n := xsk.NumFreeFillSlots(); n > 0 {
-					// ...then fetch up to that number of not-in-use
-					// descriptors and push them onto the Fill ring queue
-					// for the kernel to fill them with the received
-					// frames.
+					// 获取空闲描述符并将其推送到Fill队列
 					xsk.Fill(xsk.GetDescs(n, true))
 				}
 
-				// 移除调试日志减少IO开销
-				// 使用非阻塞Poll(0) + 忙等待（根据实际需求调整）
+				// 使用非阻塞Poll(0)来避免阻塞
 				numRx, _, err := xsk.Poll(0)
 				if err != nil {
-					fmt.Printf("error: %v\n", err)
+					fmt.Printf("Poll error on queue %d: %v\n", qid, err)
 					return
 				}
 
 				if numRx > 0 {
-					// 批量获取描述符长度（避免逐个处理）
+					// 获取接收到的描述符
 					rxDescs := xsk.Receive(numRx)
 
 					for i := 0; i < len(rxDescs); i++ {
 						pktData := xsk.GetFrame(rxDescs[i])
-						fmt.Println("receive message: ", string(pktData))
+						fmt.Printf("Received message on queue %d: %s\n", qid, string(pktData))
 						msgChan <- bytes.Clone(pktData)
 					}
 				}
@@ -180,17 +205,19 @@ func transmit(xsk *xdp.Socket, msgChan <-chan []byte) {
 	packets := make([][]byte, batch)
 	for {
 		if pos < batch {
-			fmt.Println("send message: ")
+			fmt.Println("Collecting message to send...")
 			packets[pos] = <-msgChan
 			pos++
 			continue
 		}
 		descs := xsk.GetDescs(batch, false)
 		if len(descs) == 0 {
+			fmt.Println("No available descriptors, waiting for poll...")
 			xsk.Poll(-1)
 			continue
 		}
 
+		// 填充数据并发送
 		frameLen := 0
 		for j := 0; j < len(descs); j++ {
 			frameLen = copy(xsk.GetFrame(descs[j]), packets[j])
@@ -198,6 +225,7 @@ func transmit(xsk *xdp.Socket, msgChan <-chan []byte) {
 		}
 		xsk.Transmit(descs)
 		if _, _, err := xsk.Poll(-1); err != nil {
+			fmt.Printf("Error during transmit poll: %v\n", err)
 			continue
 		}
 
