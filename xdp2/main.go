@@ -5,9 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"time"
 
 	"github.com/safchain/ethtool"
@@ -17,38 +17,75 @@ import (
 
 func main() {
 	var clientNic, serverNic nicInfo
-	if err := clientNic.New("enp26s0f0", 1); err != nil {
+	if err := clientNic.New("enp26s0f1", 1); err != nil {
 		fmt.Printf("Failed to initialize client NIC: %v\n", err)
 		return
 	}
-	if err := serverNic.New("enp26s0f1", 1); err != nil {
+	if err := serverNic.New("enp26s0f0", 1); err != nil {
 		fmt.Printf("Failed to initialize server NIC: %v\n", err)
 		return
 	}
+
+	// client -> server
 	client2ServerChan := make(chan []byte, 10000)
-	server2ClientChan := make(chan []byte, 10000)
-
+	//extractFrameFromPcap(client2ServerChan)
 	clientNic.receive(client2ServerChan)
-	clientNic.send(server2ClientChan)
-
-	serverNic.receive(server2ClientChan)
 	serverNic.send(client2ServerChan)
 
-	termChan := make(chan os.Signal)
-	// 监听退出信号
-	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
-	<-termChan
+	// server -> client
+	server2ClientChan := make(chan []byte, 10000)
+	serverNic.receive(server2ClientChan)
+	clientNic.send(server2ClientChan)
 
-	clientNic.Program.Close()
-	for i := range clientNic.socketList {
-		clientNic.socketList[i].Close()
-	}
-	serverNic.Program.Close()
-	for i := range serverNic.socketList {
-		serverNic.socketList[i].Close()
-	}
+	//termChan := make(chan os.Signal)
+	//// 监听退出信号
+	//signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
+	//<-termChan
+	//
+	//clientNic.Program.Close()
+	//for i := range clientNic.socketList {
+	//	clientNic.socketList[i].Close()
+	//}
+	//serverNic.Program.Close()
+	//for i := range serverNic.socketList {
+	//	serverNic.socketList[i].Close()
+	//}
+	select {}
 
 	fmt.Println("exit xdp program.")
+}
+
+func extractFrameFromPcap(transmitChan chan []byte) {
+	// Open pcap file
+	handle, err := pcap.OpenOffline("jxjk.pcap")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to open pcap file: %v", err))
+	}
+	defer handle.Close()
+
+	// Read packets from pcap file
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packets := packetSource.Packets()
+
+	var frames [][]byte
+	for packet := range packets {
+		// Check if the packet is a TCP packet
+		tcpLayer := packet.Layer(layers.LayerTypeTCP)
+		if tcpLayer == nil {
+			continue // Skip non-TCP packets
+		}
+
+		// Serialize the entire Ethernet frame
+		buf := gopacket.NewSerializeBuffer()
+		err := gopacket.SerializePacket(buf, gopacket.SerializeOptions{}, packet)
+		if err != nil {
+			fmt.Printf("Failed to serialize packet: %v\n", err)
+			continue
+		}
+		frames = append(frames, buf.Bytes())
+
+		transmitChan <- buf.Bytes()
+	}
 }
 
 type nicInfo struct {
@@ -137,7 +174,7 @@ func (n *nicInfo) New(nicName string, queueNum int) error {
 
 	// 创建XDP套接字
 	n.socketList = make([]*xdp.Socket, queueNum)
-	for qid := 0; qid < len(n.socketList); qid++ {
+	for qid := range n.socketList {
 		xsk, err := xdp.NewSocket(link.Attrs().Index, qid, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create XDP socket for queue %d: %v", qid, err)
@@ -185,9 +222,9 @@ func (n *nicInfo) receive(msgChan chan<- []byte) {
 
 					for i := 0; i < len(rxDescs); i++ {
 						pktData := xsk.GetFrame(rxDescs[i])
-						msgStr, _ := hex.DecodeString(string(pktData))
-						fmt.Printf("%s received: %s\n", n.NicName, msgStr)
-						msgChan <- bytes.Clone(pktData)
+						pkt := gopacket.NewPacket(bytes.Clone(pktData), layers.LayerTypeEthernet, gopacket.Default)
+						fmt.Printf("%s received: %s\n", n.NicName, string(pkt.Data()))
+						msgChan <- pkt.Data()
 					}
 				}
 			}
