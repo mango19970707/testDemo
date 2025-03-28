@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -184,7 +185,8 @@ func (n *nicInfo) receive(msgChan chan<- []byte) {
 
 					for i := 0; i < len(rxDescs); i++ {
 						pktData := xsk.GetFrame(rxDescs[i])
-						fmt.Printf("Received message on queue %d: %s\n", qid, string(pktData))
+						msgStr, _ := hex.DecodeString(string(pktData))
+						fmt.Printf("%s received: %s\n", n.NicName, msgStr)
 						msgChan <- bytes.Clone(pktData)
 					}
 				}
@@ -195,43 +197,43 @@ func (n *nicInfo) receive(msgChan chan<- []byte) {
 
 func (n *nicInfo) send(msgChan <-chan []byte) {
 	for i := 0; i < len(n.socketList); i++ {
-		go transmit(n.socketList[i], msgChan)
-	}
-}
+		go func(xsk *xdp.Socket, msgChan <-chan []byte) {
+			pos := 0
+			batch := 1
+			packets := make([][]byte, batch)
+			for {
+				if pos < batch {
+					msg := <-msgChan
+					msgStr, _ := hex.DecodeString(string(msg))
+					fmt.Printf("%s send %s\n", n.NicName, msgStr)
+					packets[pos] = msg
+					pos++
+					continue
+				}
+				descs := xsk.GetDescs(batch, false)
+				if len(descs) == 0 {
+					fmt.Println("No available descriptors, waiting for poll...")
+					xsk.Poll(-1)
+					continue
+				}
 
-func transmit(xsk *xdp.Socket, msgChan <-chan []byte) {
-	pos := 0
-	batch := 1
-	packets := make([][]byte, batch)
-	for {
-		if pos < batch {
-			fmt.Println("Collecting message to send...")
-			packets[pos] = <-msgChan
-			pos++
-			continue
-		}
-		descs := xsk.GetDescs(batch, false)
-		if len(descs) == 0 {
-			fmt.Println("No available descriptors, waiting for poll...")
-			xsk.Poll(-1)
-			continue
-		}
+				// 填充数据并发送
+				frameLen := 0
+				for j := 0; j < len(descs); j++ {
+					frameLen = copy(xsk.GetFrame(descs[j]), packets[j])
+					descs[j].Len = uint32(frameLen)
+				}
+				xsk.Transmit(descs)
+				if _, _, err := xsk.Poll(-1); err != nil {
+					fmt.Printf("Error during transmit poll: %v\n", err)
+					continue
+				}
 
-		// 填充数据并发送
-		frameLen := 0
-		for j := 0; j < len(descs); j++ {
-			frameLen = copy(xsk.GetFrame(descs[j]), packets[j])
-			descs[j].Len = uint32(frameLen)
-		}
-		xsk.Transmit(descs)
-		if _, _, err := xsk.Poll(-1); err != nil {
-			fmt.Printf("Error during transmit poll: %v\n", err)
-			continue
-		}
-
-		for i := 0; i < len(descs) && i+len(descs) < batch; i++ {
-			packets[i] = packets[i+len(descs)]
-		}
-		pos = batch - len(descs)
+				for i := 0; i < len(descs) && i+len(descs) < batch; i++ {
+					packets[i] = packets[i+len(descs)]
+				}
+				pos = batch - len(descs)
+			}
+		}(n.socketList[i], msgChan)
 	}
 }
